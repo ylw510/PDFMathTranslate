@@ -8,14 +8,16 @@ from string import Template
 from typing import Dict
 
 import numpy as np
+import requests
 from pdfminer.converter import PDFConverter
 from pdfminer.layout import LTChar, LTFigure, LTLine, LTPage
 from pdfminer.pdffont import PDFCIDFont, PDFUnicodeNotDefined
 from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
 from pdfminer.utils import apply_matrix_pt, mult_matrix
 from pymupdf import Font
-from tenacity import retry, wait_fixed
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
+from pdf2zh.sentence_map import pair_sentence_units, sentence_units
 from pdf2zh.text_spacing import add_cjk_latin_spacing
 from pdf2zh.translator import (
     AnythingLLMTranslator,
@@ -46,6 +48,14 @@ from pdf2zh.translator import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class TranslationServiceError(RuntimeError):
+    """The translation service rejected the request. Do not retry."""
+
+
+def _retry_translation(exc: BaseException) -> bool:
+    return not isinstance(exc, TranslationServiceError)
 
 
 class PDFConverterEx(PDFConverter):
@@ -158,6 +168,7 @@ class TranslateConverter(PDFConverterEx):
         self.perf = None
         self.translation_pool = None
         self.translation_futures = None
+        self.sentence_map: dict[int, list] = {}
         self.translator: BaseTranslator = None
         # e.g. "ollama:gemma2:9b" -> ["ollama", "gemma2:9b"]
         param = service.split(":", 1)
@@ -176,6 +187,7 @@ class TranslateConverter(PDFConverterEx):
         started = perf_counter() if self.perf else 0
         # 段落
         sstk: list[str] = []            # 段落文字栈
+        sglyphs: list[list[dict]] = []  # 段落原文字形，供句级坐标
         pstk: list[Paragraph] = []      # 段落属性栈
         vbkt: int = 0                   # 段落公式括号计数
         # 公式组
@@ -193,6 +205,21 @@ class TranslateConverter(PDFConverterEx):
         xt_cls: int = -1                # 上一个字符所属段落，保证无论第一个字符属于哪个类别都可以触发新段落
         vmax: float = ltpage.width / 4  # 行内公式最大宽度
         ops: str = ""                   # 渲染结果
+        record_sentences = isinstance(ltpage, LTPage)
+        noto_asc = float(getattr(self.noto, "ascender", 1.15) or 1.15)
+        noto_desc = float(getattr(self.noto, "descender", -0.29) or -0.29)
+
+        def push_formula_glyphs() -> None:
+            if not sglyphs:
+                return
+            for vch in vstk:
+                sglyphs[-1].append(
+                    {
+                        "c": vch.get_text() or "",
+                        "formula": True,
+                        "bbox": [float(vch.x0), float(vch.y0), float(vch.x1), float(vch.y1)],
+                    }
+                )
 
         def vflag(font: str, char: str):    # 匹配公式（和角标）字体
             if isinstance(font, bytes):     # 不一定能 decode，直接转 str
@@ -279,6 +306,7 @@ class TranslateConverter(PDFConverterEx):
                         if sstk[-1] == "":
                             xt_cls = -1 # 禁止纯公式段落（sstk[-1]=="{v*}"）的后续连接，但是要考虑新字符和后续字符的连接，所以这里修改的是上个字符的类别
                         sstk[-1] += f"{{v{len(var)}}}"
+                        push_formula_glyphs()
                         var.append(vstk)
                         varl.append(vlstk)
                         varf.append(vfix)
@@ -290,11 +318,14 @@ class TranslateConverter(PDFConverterEx):
                     if cls == xt_cls:               # 当前字符与前一个字符属于同一段落
                         if child.x0 > xt.x1 + 1:    # 添加行内空格
                             sstk[-1] += " "
+                            sglyphs[-1].append({"c": " "})
                         elif child.x1 < xt.x0:      # 添加换行空格并标记原文段落存在换行
                             sstk[-1] += " "
+                            sglyphs[-1].append({"c": " "})
                             pstk[-1].brk = True
                     else:                           # 根据当前字符构建一个新的段落
                         sstk.append("")
+                        sglyphs.append([])
                         pstk.append(Paragraph(child.y0, child.x0, child.x0, child.x0, child.y0, child.y1, child.size, False))
                 if not cur_v:                                               # 文字入栈
                     if (                                                    # 根据当前字符修正段落属性
@@ -304,6 +335,12 @@ class TranslateConverter(PDFConverterEx):
                         pstk[-1].y -= child.size - pstk[-1].size            # 修正段落初始纵坐标，假设两个不同大小字符的上边界对齐
                         pstk[-1].size = child.size
                     sstk[-1] += child.get_text()
+                    sglyphs[-1].append(
+                        {
+                            "c": child.get_text() or "",
+                            "bbox": [float(child.x0), float(child.y0), float(child.x1), float(child.y1)],
+                        }
+                    )
                 else:                                                       # 公式入栈
                     if (                                                    # 根据公式左侧的文字修正公式的纵向偏移
                         not vstk                                            # 1. 当前字符是公式的第一个字符
@@ -338,6 +375,7 @@ class TranslateConverter(PDFConverterEx):
         # 处理结尾
         if vstk:    # 公式出栈
             sstk[-1] += f"{{v{len(var)}}}"
+            push_formula_glyphs()
             var.append(vstk)
             varl.append(vlstk)
             varf.append(vfix)
@@ -351,13 +389,26 @@ class TranslateConverter(PDFConverterEx):
         # B. 段落翻译
         log.debug("\n==========[SSTACK]==========\n")
 
-        @retry(wait=wait_fixed(1))
+        @retry(
+            retry=retry_if_exception(_retry_translation),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=8),
+            reraise=True,
+        )
         def worker(s: str):  # 多线程翻译
             if not s.strip() or re.match(r"^\{v\d+\}$", s):  # 空白和公式不翻译
                 return s
             try:
                 new = self.translator.translate(s)
                 return new
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status == 429:
+                    raise TranslationServiceError(
+                        "翻译服务被限流（HTTP 429）。请把 Service 改成 Bing，或稍后再试。"
+                    ) from e
+                log.exception(e, exc_info=False)
+                raise
             except BaseException as e:
                 if log.isEnabledFor(logging.DEBUG):
                     log.exception(e)
@@ -401,6 +452,7 @@ class TranslateConverter(PDFConverterEx):
         default_line_height = LANG_LINEHEIGHT_MAP.get(self.translator.lang_out.lower(), 1.1) # 小语种默认1.1
         _x, _y = 0, 0
         ops_list = []
+        page_pairs: list[dict] = []
 
         def gen_op_txt(font, size, x, y, rtxt):
             return f"/{font} {size:f} Tf 1 0 0 1 {x:f} {y:f} Tm [<{rtxt}>] TJ "
@@ -426,6 +478,7 @@ class TranslateConverter(PDFConverterEx):
             log.debug(f"< {y} {x} {x0} {x1} {size} {brk} > {sstk[id]} | {new}")
 
             ops_vals: list[dict] = []
+            placed: list[dict] = []
 
             while ptr < len(new):
                 vy_regex = re.match(
@@ -490,6 +543,14 @@ class TranslateConverter(PDFConverterEx):
                             "rtxt": raw_string(self.fontid[vch.font], vc),
                             "lidx": lidx
                         })
+                        placed.append({
+                            "formula": True,
+                            "x0": x + vch.x0 - var[vid][0].x0,
+                            "dy": fix + vch.y0 - var[vid][0].y0,
+                            "w": max(vch.x1 - vch.x0, 0.1),
+                            "h": max(vch.y1 - vch.y0, 0.1),
+                            "lidx": lidx,
+                        })
                         if log.isEnabledFor(logging.DEBUG):
                             lstk.append(LTLine(0.1, (_x, _y), (x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0)))
                             _x, _y = x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0
@@ -509,9 +570,28 @@ class TranslateConverter(PDFConverterEx):
                         tx = x
                         if x == x0 and ch == " ":  # 消除段落换行空格
                             adv = 0
+                            placed.append({"c": " ", "skip": True})
                         else:
+                            placed.append({
+                                "c": ch,
+                                "x0": x,
+                                "adv": adv,
+                                "lidx": lidx,
+                                "size": size,
+                                "asc": noto_asc if fcur_ == self.noto_name else 1.05,
+                                "desc": noto_desc if fcur_ == self.noto_name else -0.28,
+                            })
                             cstk += ch
                     else:
+                        placed.append({
+                            "c": ch,
+                            "x0": x,
+                            "adv": adv,
+                            "lidx": lidx,
+                            "size": size,
+                            "asc": noto_asc if fcur_ == self.noto_name else 1.05,
+                            "desc": noto_desc if fcur_ == self.noto_name else -0.28,
+                        })
                         cstk += ch
                 adv -= mod # 文字修饰符
                 fcur = fcur_
@@ -541,6 +621,46 @@ class TranslateConverter(PDFConverterEx):
                     ops_list.append(gen_op_txt(vals["font"], vals["size"], vals["x"], vals["dy"] + y - vals["lidx"] * size * line_height, vals["rtxt"]))
                 elif vals["type"] == OpType.LINE:
                     ops_list.append(gen_op_line(vals["x"], vals["dy"] + y - vals["lidx"] * size * line_height, vals["xlen"], vals["ylen"], vals["linewidth"]))
+
+            if record_sentences and ltpage.width > 0 and ltpage.height > 0 and id < len(sglyphs):
+                page_w = float(ltpage.width)
+                page_h = float(ltpage.height)
+                dst_glyphs = []
+                for item in placed:
+                    if item.get("skip"):
+                        dst_glyphs.append({"c": " "})
+                        continue
+                    if item.get("formula"):
+                        y0 = y + item["dy"] - item["lidx"] * size * line_height
+                        dst_glyphs.append(
+                            {
+                                "c": "",
+                                "formula": True,
+                                "bbox": [item["x0"], y0, item["x0"] + item["w"], y0 + item["h"]],
+                            }
+                        )
+                        continue
+                    baseline = y - item["lidx"] * size * line_height
+                    glyph_size = item["size"]
+                    # The text matrix y is the baseline. CJK ink extends above it
+                    # by more than one em, so a box of height `size` cuts through the glyphs.
+                    y0 = baseline + item.get("desc", 0) * glyph_size
+                    y1 = baseline + item.get("asc", 1) * glyph_size
+                    dst_glyphs.append(
+                        {
+                            "c": item["c"],
+                            "bbox": [item["x0"], y0, item["x0"] + item["adv"], y1],
+                        }
+                    )
+                src_units = sentence_units(sglyphs[id], page_w, page_h)
+                dst_units = sentence_units(dst_glyphs, page_w, page_h)
+                page_pairs.extend(
+                    {"src": src_rects, "dst": dst_rects}
+                    for src_rects, dst_rects in pair_sentence_units(src_units, dst_units)
+                )
+
+        if record_sentences and page_pairs:
+            self.sentence_map.setdefault(int(ltpage.pageid), []).extend(page_pairs)
 
         for l in lstk:  # 排版全局线条
             if l.linewidth < 5:  # hack 有的文档会用粗线条当图片背景

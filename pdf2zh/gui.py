@@ -1,5 +1,6 @@
 import asyncio
 import cgi
+import json
 import os
 import shutil
 import socket
@@ -169,6 +170,10 @@ def verify_recaptcha(response):
     return result.get("success")
 
 
+class PreviewInputError(Exception):
+    """The link or file cannot be shown in the preview."""
+
+
 def download_with_limit(url: str, save_path: str, size_limit: int) -> str:
     """
     This function downloads a file from a URL and saves it to a specified path.
@@ -183,22 +188,52 @@ def download_with_limit(url: str, save_path: str, size_limit: int) -> str:
     """
     chunk_size = 1024
     total_size = 0
-    with requests.get(url, stream=True, timeout=10) as response:
-        response.raise_for_status()
-        content = response.headers.get("Content-Disposition")
-        try:  # filename from header
-            _, params = cgi.parse_header(content)
-            filename = params["filename"]
-        except Exception:  # filename from url
-            filename = os.path.basename(url)
-        filename = os.path.splitext(os.path.basename(filename))[0] + ".pdf"
-        with open(save_path / filename, "wb") as file:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                total_size += len(chunk)
-                if size_limit and total_size > size_limit:
-                    raise gr.Error("Exceeds file size limit")
-                file.write(chunk)
-    return save_path / filename
+    try:
+        with requests.get(url, stream=True, timeout=20) as response:
+            response.raise_for_status()
+            content = response.headers.get("Content-Disposition")
+            try:  # filename from header
+                _, params = cgi.parse_header(content)
+                filename = params["filename"]
+            except Exception:  # filename from url
+                filename = os.path.basename(url)
+            filename = os.path.splitext(os.path.basename(filename))[0] + ".pdf"
+            saved = save_path / filename
+            with open(saved, "wb") as file:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    total_size += len(chunk)
+                    if size_limit and total_size > size_limit:
+                        raise gr.Error("Exceeds file size limit")
+                    file.write(chunk)
+    except requests.RequestException as exc:
+        raise PreviewInputError(
+            "链接下载失败。请换一个 PDF 直链，或改用 File 上传。"
+        ) from exc
+    with open(saved, "rb") as file:
+        if file.read(5) != b"%PDF-":
+            saved.unlink(missing_ok=True)
+            raise PreviewInputError(
+                "这个链接不是 PDF。请使用 PDF 文件地址，或改用 File 上传。"
+            )
+    return saved
+
+
+def unchanged_preview(message: str):
+    """Keep the current preview and show why this attempt failed."""
+    return (
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(value=message, visible=True),
+    )
 
 
 def stop_translate_file(state: dict) -> None:
@@ -216,6 +251,69 @@ def stop_translate_file(state: dict) -> None:
     if session_id in cancellation_event_map:
         logger.info(f"Stopping translation for session {session_id}")
         cancellation_event_map[session_id].set()
+
+
+def build_bilingual_preview(
+    dual_pdf: Path, dest_dir: Path, filename: str
+) -> tuple[str, str]:
+    """Split interleaved dual pages into one original PDF and one translation PDF.
+
+    Each result keeps the source page size, so the preview can fit every page to
+    its own column instead of scaling one double-width sheet.
+    """
+    import pymupdf
+
+    original_dest = dest_dir / f"{filename}-preview-original.pdf"
+    translated_dest = dest_dir / f"{filename}-preview-translated.pdf"
+    with pymupdf.open(dual_pdf) as dual:
+        original = pymupdf.open()
+        translated = pymupdf.open()
+        pair_count = dual.page_count // 2
+        for i in range(pair_count):
+            original.insert_pdf(dual, from_page=i * 2, to_page=i * 2)
+            translated.insert_pdf(dual, from_page=i * 2 + 1, to_page=i * 2 + 1)
+        original.save(original_dest, deflate=True, garbage=3)
+        translated.save(translated_dest, deflate=True, garbage=3)
+        original.close()
+        translated.close()
+    return str(original_dest), str(translated_dest)
+
+
+def paper_pages_for_preview(selected_page: list[int] | None, pair_count: int) -> list[int]:
+    """Map each preview slot to the 1-based page number in the source PDF."""
+    if pair_count <= 0:
+        return []
+    if not selected_page:
+        return list(range(1, pair_count + 1))
+    return [page + 1 for page in selected_page[:pair_count]]
+
+
+def render_sentence_map(map_path: str | None) -> str:
+    """Preview reads the sidecar written at typeset time. It does not re-segment the PDF."""
+    pages: list = []
+    if map_path and os.path.exists(map_path):
+        with open(map_path, encoding="utf-8") as handle:
+            pages = json.load(handle)
+    payload = json.dumps(pages, ensure_ascii=False, separators=(",", ":")).replace(
+        "<", "\\u003c"
+    )
+    return f'<pre id="sentence-map" style="display:none">{payload}</pre>'
+
+
+def render_paper_pager(pages: list[int]) -> str:
+    """Shared pager. The number typed is the source paper page, not the pair index."""
+    if not pages:
+        return ""
+    joined = ",".join(str(page) for page in pages)
+    return (
+        f'<div id="paper-pager" data-pages="{joined}">'
+        f'<button type="button" class="paper-page-btn" data-dir="-1">上一页</button>'
+        f'<span class="paper-page-label">第 '
+        f'<input id="paper-page-input" type="number" min="{min(pages)}" max="{max(pages)}" value="{pages[0]}">'
+        f" 页 / 共 {len(pages)} 页</span>"
+        f'<button type="button" class="paper-page-btn" data-dir="1">下一页</button>'
+        f"</div>"
+    )
 
 
 def translate_file(
@@ -284,11 +382,14 @@ def translate_file(
     else:
         if not link_input:
             raise gr.Error("No input")
-        file_path = download_with_limit(
-            link_input,
-            output,
-            5 * 1024 * 1024 if flag_demo else None,
-        )
+        try:
+            file_path = download_with_limit(
+                link_input,
+                output,
+                5 * 1024 * 1024 if flag_demo else None,
+            )
+        except PreviewInputError as exc:
+            return unchanged_preview(str(exc))
 
     filename = os.path.splitext(os.path.basename(file_path))[0]
     file_raw = output / f"{filename}.pdf"
@@ -322,11 +423,17 @@ def translate_file(
 
     print(f"Files before translation: {os.listdir(output)}")
 
-    def progress_bar(t: tqdm.tqdm):
-        desc = getattr(t, "desc", "Translating...")
-        if desc == "":
-            desc = "Translating..."
-        progress(t.n / t.total, desc=desc)
+    def progress_bar(t):
+        if isinstance(t, dict):
+            raw = float(t.get("overall_progress") or 0)
+            frac = raw / 100.0 if raw > 1 else raw
+            desc = t.get("stage") or "Translating..."
+        else:
+            total = getattr(t, "total", None) or 0
+            done = getattr(t, "n", 0) or 0
+            frac = done / total if total else 0
+            desc = getattr(t, "desc", None) or "Translating..."
+        progress(min(1.0, max(0.0, float(frac))), desc=str(desc))
 
     try:
         threads = int(threads)
@@ -379,20 +486,43 @@ def translate_file(
     except CancelledError:
         del cancellation_event_map[session_id]
         raise gr.Error("Translation cancelled")
+    except Exception as exc:
+        from pdf2zh.converter import TranslationServiceError
+
+        if isinstance(exc, TranslationServiceError):
+            return unchanged_preview(str(exc))
+        raise
     print(f"Files after translation: {os.listdir(output)}")
 
     if not file_mono.exists() or not file_dual.exists():
         raise gr.Error("No output")
 
+    original_preview, translated_preview = build_bilingual_preview(
+        file_dual, output, filename
+    )
+    import pymupdf
+
+    with pymupdf.open(file_dual) as dual:
+        pair_count = dual.page_count // 2
+    paper_pages = paper_pages_for_preview(selected_page, pair_count)
+
     progress(1.0, desc="Translation complete!")
 
     return (
         str(file_mono),
-        str(file_mono),
+        gr.update(visible=False),
         str(file_dual),
         gr.update(visible=True),
         gr.update(visible=True),
         gr.update(visible=True),
+        original_preview,
+        translated_preview,
+        gr.update(visible=True),
+        render_paper_pager(paper_pages),
+        render_sentence_map(
+            str(output / f"{filename}-preview-sentence-map.json")
+        ),
+        gr.update(visible=False),
     )
 
 
@@ -537,8 +667,171 @@ custom_css = """
         border-radius: 8px !important;
     }
 
+    .pdf-canvas {
+        display: block !important;
+        height: auto !important;
+        overflow: visible !important;
+        position: relative !important;
+    }
+
+    .sent-layer {
+        position: absolute;
+        pointer-events: none;
+    }
+
+    .sent-hit {
+        position: absolute;
+        pointer-events: auto;
+        border-radius: 3px;
+    }
+
+    .sent-hit.on-src.active {
+        background: rgba(22, 93, 255, 0.16);
+    }
+
+    .sent-hit.on-dst.active {
+        background: rgba(0, 180, 42, 0.30);
+        box-shadow: inset 0 0 0 2px rgba(0, 128, 38, 0.55);
+    }
+
     .pdf-canvas canvas {
+        width: 100% !important;
+        height: auto !important;
+        max-width: 100%;
+    }
+
+    #bilingual-pages {
+        align-items: flex-start !important;
+        flex-wrap: nowrap !important;
+        gap: 16px !important;
         width: 100%;
+    }
+
+    #bilingual-pages > div {
+        min-width: 0 !important;
+        flex: 1 1 0% !important;
+    }
+
+    #bilingual-pages .button-row {
+        display: none !important;
+    }
+
+    .preview-side-label {
+        display: block;
+        margin: 0 0 8px;
+        padding: 8px 14px;
+        border-radius: 8px;
+        font-size: 16px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+    }
+
+    .preview-side-original {
+        color: #0E42D2;
+        background: #E8F3FF;
+        border: 1px solid #94BFFF;
+    }
+
+    .preview-side-translated {
+        color: #008026;
+        background: #E8FFEA;
+        border: 1px solid #7BE188;
+    }
+
+    #bilingual-preview,
+    #paper-page-bar,
+    #bilingual-pages {
+        width: 100%;
+    }
+
+    #preview-error {
+        color: #CB272D;
+        background: #FFECE8;
+        border: 1px solid #FBACA3;
+        border-radius: 8px;
+        padding: 10px 14px;
+    }
+
+    #paper-pager {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        flex-wrap: nowrap;
+        gap: 12px;
+        width: 100%;
+        box-sizing: border-box;
+        margin: 0 0 12px;
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: #F7F8FA;
+    }
+
+    #paper-pager .paper-page-btn {
+        border: 1px solid #C9CDD4;
+        background: #fff;
+        border-radius: 6px;
+        padding: 6px 14px;
+        cursor: pointer;
+        font-size: 14px;
+        white-space: nowrap;
+    }
+
+    #paper-pager .paper-page-label {
+        font-size: 15px;
+        font-weight: 600;
+        white-space: nowrap;
+    }
+
+    #paper-page-input {
+        width: 72px;
+        margin: 0 4px;
+        padding: 4px 8px;
+        border: 1px solid #C9CDD4;
+        border-radius: 6px;
+        font-size: 15px;
+        text-align: center;
+    }
+
+    #workspace {
+        flex-wrap: nowrap !important;
+        align-items: stretch !important;
+    }
+
+    #sidebar-shell {
+        position: relative !important;
+        overflow: hidden !important;
+        min-width: 320px !important;
+        flex: 1 1 0% !important;
+        transition: min-width 0.28s ease, max-width 0.28s ease, flex-basis 0.28s ease;
+    }
+
+    #sidebar-shell.collapsed {
+        min-width: 36px !important;
+        max-width: 36px !important;
+        flex: 0 0 36px !important;
+    }
+
+    #sidebar-shell.collapsed > :not(#sidebar-handle) {
+        display: none !important;
+    }
+
+    #sidebar-handle {
+        position: absolute !important;
+        z-index: 20;
+        top: 8px;
+        right: 0;
+        width: 28px !important;
+        min-width: 28px !important;
+        max-width: 28px !important;
+        height: 64px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border-radius: 8px 0 0 8px !important;
+    }
+
+    #sidebar-shell.collapsed #sidebar-handle {
+        right: 4px;
+        border-radius: 8px !important;
     }
     """
 
@@ -577,8 +870,12 @@ with gr.Blocks(
         "# [PDFMathTranslate @ GitHub](https://github.com/Byaidu/PDFMathTranslate)"
     )
 
-    with gr.Row():
-        with gr.Column(scale=1):
+    with gr.Row(elem_id="workspace"):
+        with gr.Column(scale=1, min_width=0, elem_id="sidebar-shell"):
+            toggle_sidebar_btn = gr.Button(
+                "◀",
+                elem_id="sidebar-handle",
+            )
             gr.Markdown("## File | < 5 MB" if flag_demo else "## File")
             file_type = gr.Radio(
                 choices=["File", "Link"],
@@ -751,15 +1048,46 @@ with gr.Blocks(
                 ),
             )
 
-        with gr.Column(scale=2):
+        with gr.Column(scale=2, min_width=0, elem_id="preview-panel"):
             gr.Markdown("## Preview")
-            preview = PDF(label="Document Preview", visible=True, height=2000)
+            preview_error = gr.Markdown(visible=False, elem_id="preview-error")
+            preview = PDF(label="Document Preview", visible=True, height=1400)
+            with gr.Column(visible=False, elem_id="bilingual-preview") as bilingual_preview:
+                paper_page_bar = gr.HTML(value="", elem_id="paper-page-bar", padding=False)
+                sentence_map = gr.HTML(value="", elem_id="sentence-map-host", padding=False)
+                with gr.Row(elem_id="bilingual-pages"):
+                    with gr.Column(scale=1, min_width=0):
+                        gr.HTML(
+                            '<div class="preview-side-label preview-side-original">原文</div>',
+                            padding=False,
+                        )
+                        preview_original = PDF(
+                            show_label=False,
+                            visible=True,
+                            height=1400,
+                            interactive=False,
+                        )
+                    with gr.Column(scale=1, min_width=0):
+                        gr.HTML(
+                            '<div class="preview-side-label preview-side-translated">译文</div>',
+                            padding=False,
+                        )
+                        preview_translated = PDF(
+                            show_label=False,
+                            visible=True,
+                            height=1400,
+                            interactive=False,
+                        )
 
     # Event handlers
     file_input.upload(
-        lambda x: x,
+        lambda file_path: (
+            gr.update(value=file_path, visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+        ),
         inputs=file_input,
-        outputs=preview,
+        outputs=[preview, bilingual_preview, preview_error],
         js=(
             f"""
             (a,b)=>{{
@@ -778,6 +1106,24 @@ with gr.Blocks(
     )
 
     state = gr.State({"session_id": None})
+
+    toggle_sidebar_btn.click(
+        lambda: None,
+        js="""
+            () => {
+                const shell = document.getElementById('sidebar-shell');
+                if (!shell) return;
+                const collapsed = shell.classList.toggle('collapsed');
+                const btn = document.getElementById('sidebar-handle');
+                if (!btn) return;
+                const label = collapsed ? '▶' : '◀';
+                const nodes = btn.querySelectorAll('span');
+                const target = nodes.length ? nodes[nodes.length - 1] : btn;
+                target.textContent = label;
+            }
+        """,
+        show_progress="hidden",
+    )
 
     translate_btn.click(
         translate_file,
@@ -807,12 +1153,205 @@ with gr.Blocks(
             output_file_mono,
             output_file_dual,
             output_title,
+            preview_original,
+            preview_translated,
+            bilingual_preview,
+            paper_page_bar,
+            sentence_map,
+            preview_error,
         ],
-    ).then(lambda: None, js="()=>{grecaptcha.reset()}" if flag_demo else "")
+    ).then(
+        lambda: None,
+        js="""
+            () => {
+                try { grecaptcha.reset(); } catch (e) {}
+                const shell = document.getElementById('sidebar-shell');
+                const btn = document.getElementById('sidebar-handle');
+                const setGlyph = (glyph) => {
+                    if (!btn) return;
+                    const nodes = btn.querySelectorAll('span');
+                    const target = nodes.length ? nodes[nodes.length - 1] : btn;
+                    target.textContent = glyph;
+                };
+                const error = document.getElementById('preview-error');
+                const failed = error && error.offsetParent !== null;
+                if (!shell) return;
+                if (failed) {
+                    shell.classList.remove('collapsed');
+                    setGlyph('◀');
+                    return;
+                }
+                const bilingual = document.getElementById('bilingual-preview');
+                if (!bilingual || bilingual.offsetParent === null) return;
+                if (shell.classList.contains('collapsed')) return;
+                shell.classList.add('collapsed');
+                setGlyph('▶');
+            }
+        """,
+        show_progress="hidden",
+    )
 
     cancellation_btn.click(
         stop_translate_file,
         inputs=[state],
+    )
+
+    demo.load(
+        lambda: None,
+        js="""
+            () => {
+                if (window.__pdf2zhPageSync) return;
+                window.__pdf2zhPageSync = true;
+                let last = [null, null];
+                let lock = false;
+
+                const pagesOf = () => {
+                    const el = document.querySelector('#paper-pager');
+                    if (!el || !el.dataset.pages) return [];
+                    return el.dataset.pages.split(',')
+                        .map((part) => parseInt(part, 10))
+                        .filter((page) => Number.isFinite(page));
+                };
+                const inputsOf = () => [...document.querySelectorAll('#bilingual-pages .page-count input')];
+                const currentSlot = () => {
+                    const inputs = inputsOf();
+                    const slot = inputs.length ? parseInt(inputs[0].value, 10) : 1;
+                    return Number.isFinite(slot) && slot > 0 ? slot : 1;
+                };
+                const showPaperPage = (slot) => {
+                    const pages = pagesOf();
+                    const box = document.getElementById('paper-page-input');
+                    if (!box || !pages.length || document.activeElement === box) return;
+                    const paper = pages[Math.min(Math.max(slot, 1), pages.length) - 1];
+                    if (box.value !== String(paper)) box.value = String(paper);
+                };
+                const setSlot = (slot) => {
+                    const pages = pagesOf();
+                    const inputs = inputsOf();
+                    if (!pages.length || inputs.length < 2) return;
+                    const next = Math.min(Math.max(slot, 1), pages.length);
+                    lock = true;
+                    inputs.forEach((input) => {
+                        if (String(input.value) === String(next)) return;
+                        input.value = String(next);
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                    });
+                    lock = false;
+                    showPaperPage(next);
+                };
+                const jumpToPaperPage = (paperPage) => {
+                    const pages = pagesOf();
+                    const box = document.getElementById('paper-page-input');
+                    const index = pages.indexOf(paperPage);
+                    if (index < 0) {
+                        const paper = pages[currentSlot() - 1];
+                        if (box && paper !== undefined) box.value = String(paper);
+                        if (box) box.blur();
+                        return;
+                    }
+                    if (box) box.blur();
+                    setSlot(index + 1);
+                };
+
+                document.addEventListener('click', (event) => {
+                    const btn = event.target.closest('#paper-pager .paper-page-btn');
+                    if (!btn) return;
+                    event.preventDefault();
+                    const dir = parseInt(btn.dataset.dir, 10) || 0;
+                    setSlot(currentSlot() + dir);
+                });
+                document.addEventListener('change', (event) => {
+                    if (event.target.id !== 'paper-page-input') return;
+                    jumpToPaperPage(parseInt(event.target.value, 10));
+                });
+                document.addEventListener('keydown', (event) => {
+                    if (event.target.id !== 'paper-page-input' || event.key !== 'Enter') return;
+                    event.preventDefault();
+                    jumpToPaperPage(parseInt(event.target.value, 10));
+                });
+
+                setInterval(() => {
+                    if (lock) return;
+                    const root = document.getElementById('bilingual-preview');
+                    if (!root || root.offsetParent === null) return;
+                    const inputs = inputsOf();
+                    if (inputs.length < 2) return;
+                    const vals = inputs.map((el) => el.value);
+                    if (vals[0] !== vals[1]) {
+                        let src = 0;
+                        if (vals[0] === last[0] && vals[1] !== last[1]) src = 1;
+                        const dst = 1 - src;
+                        lock = true;
+                        inputs[dst].value = vals[src];
+                        inputs[dst].dispatchEvent(new Event('input', { bubbles: true }));
+                        lock = false;
+                    }
+                    last = [inputs[0].value, inputs[1].value];
+                    const slot = parseInt(inputs[0].value, 10);
+                    if (Number.isFinite(slot)) {
+                        showPaperPage(slot);
+                        mountSentences(slot);
+                    }
+                }, 200);
+
+                const mountSentences = (slot) => {
+                    const pre = document.getElementById('sentence-map');
+                    const hosts = [...document.querySelectorAll('#bilingual-pages .pdf-canvas')];
+                    if (!pre || hosts.length < 2) return;
+                    const canvas = hosts[0].querySelector('canvas');
+                    if (!canvas || canvas.clientWidth < 20) return;
+                    let data;
+                    try { data = JSON.parse(pre.textContent); } catch (e) { return; }
+                    const page = data[slot - 1];
+                    if (!page) return;
+                    const key = slot + ':' + canvas.clientWidth + 'x' + canvas.clientHeight + ':' + pre.textContent.length;
+                    if (hosts[0].dataset.sentKey === key) return;
+                    const setActive = (index) => {
+                        document.querySelectorAll('#bilingual-pages .sent-hit').forEach((el) => {
+                            el.classList.toggle('active', el.dataset.pair === String(index));
+                        });
+                    };
+                    hosts.forEach((host, side) => {
+                        host.dataset.sentKey = key;
+                        host.querySelectorAll('.sent-layer').forEach((el) => el.remove());
+                        const canvas = host.querySelector('canvas');
+                        if (!canvas) return;
+                        const layer = document.createElement('div');
+                        layer.className = 'sent-layer';
+                        const hostRect = host.getBoundingClientRect();
+                        const canvasRect = canvas.getBoundingClientRect();
+                        layer.style.left = (canvasRect.left - hostRect.left) + 'px';
+                        layer.style.top = (canvasRect.top - hostRect.top) + 'px';
+                        layer.style.width = canvasRect.width + 'px';
+                        layer.style.height = canvasRect.height + 'px';
+                        const rectsOf = (value) => {
+                            if (!value || !value.length) return [];
+                            return Array.isArray(value[0]) ? value : [value];
+                        };
+                        page.pairs.forEach((pair, index) => {
+                            rectsOf(side === 0 ? pair.src : pair.dst).forEach((box) => {
+                                const hit = document.createElement('div');
+                                hit.className = 'sent-hit ' + (side === 0 ? 'on-src' : 'on-dst');
+                                hit.dataset.pair = String(index);
+                                hit.style.left = (box[0] * 100) + '%';
+                                hit.style.top = (box[1] * 100) + '%';
+                                hit.style.width = (box[2] * 100) + '%';
+                                hit.style.height = (box[3] * 100) + '%';
+                                hit.addEventListener('mouseenter', () => setActive(index));
+                                hit.addEventListener('mouseleave', (event) => {
+                                    const next = event.relatedTarget;
+                                    if (next && next.dataset && next.dataset.pair === String(index)) return;
+                                    setActive(-1);
+                                });
+                                layer.appendChild(hit);
+                            });
+                        });
+                        host.appendChild(layer);
+                    });
+                };
+            }
+        """,
+        show_progress="hidden",
     )
 
 

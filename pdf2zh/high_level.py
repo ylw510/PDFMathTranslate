@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import re
 import sys
@@ -276,8 +277,9 @@ def translate_patch(
                     )
             assert not device.translation_futures
 
+    sentence_map = {int(page): pairs for page, pairs in device.sentence_map.items()}
     device.close()
-    return obj_patch
+    return obj_patch, sentence_map
 
 
 def _ocr_tessdata(language):
@@ -470,7 +472,7 @@ def translate_stream(
     doc_zh.save(fp)
     if perf:
         perf.step("working_copy_save")
-    obj_patch: dict = translate_patch(fp, **locals())
+    obj_patch, sentence_map = translate_patch(fp, **locals())
     if perf:
         perf.step("page_processing")
 
@@ -501,6 +503,11 @@ def translate_stream(
         perf.step("pdf_serialize")
         if own_perf:
             perf.report()
+    sink = kwarg.get("sentence_sink")
+    if isinstance(sink, list):
+        sink.append(
+            [{"pairs": sentence_map.get(i, [])} for i in range(page_count)]
+        )
     return result
 
 
@@ -650,9 +657,15 @@ def translate(
         except Exception:
             logger.warning(f"Failed to clean temp file {file_path}", exc_info=True)
 
+        sentence_sink: list = []
         s_mono, s_dual = translate_stream(
             s_raw,
             **locals(),
+        )
+        map_path = Path(output) / f"{filename}-preview-sentence-map.json"
+        map_path.write_text(
+            json.dumps(sentence_sink[0] if sentence_sink else [], ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
         )
         file_mono = Path(output) / f"{filename}-mono.pdf"
         file_dual = Path(output) / f"{filename}-dual.pdf"
