@@ -232,6 +232,8 @@ def unchanged_preview(message: str):
         gr.update(),
         gr.update(),
         gr.update(),
+        gr.update(),
+        gr.update(),
         gr.update(value=message, visible=True),
     )
 
@@ -277,6 +279,34 @@ def build_bilingual_preview(
         original.close()
         translated.close()
     return str(original_dest), str(translated_dest)
+
+
+def build_side_by_side_pdf(dual_pdf: Path, dest_dir: Path, filename: str) -> str:
+    """One sheet per source page: original on the left, translation on the right."""
+    import pymupdf
+
+    dest = dest_dir / f"{filename}-side.pdf"
+    with pymupdf.open(dual_pdf) as dual:
+        side = pymupdf.open()
+        for i in range(dual.page_count // 2):
+            left = dual[i * 2]
+            right = dual[i * 2 + 1]
+            width = left.rect.width + right.rect.width
+            height = max(left.rect.height, right.rect.height)
+            page = side.new_page(width=width, height=height)
+            page.show_pdf_page(
+                pymupdf.Rect(0, 0, left.rect.width, left.rect.height),
+                dual,
+                i * 2,
+            )
+            page.show_pdf_page(
+                pymupdf.Rect(left.rect.width, 0, width, right.rect.height),
+                dual,
+                i * 2 + 1,
+            )
+        side.save(dest, deflate=True, garbage=3)
+        side.close()
+    return str(dest)
 
 
 def paper_pages_for_preview(selected_page: list[int] | None, pair_count: int) -> list[int]:
@@ -500,6 +530,7 @@ def translate_file(
     original_preview, translated_preview = build_bilingual_preview(
         file_dual, output, filename
     )
+    file_side = build_side_by_side_pdf(file_dual, output, filename)
     import pymupdf
 
     with pymupdf.open(file_dual) as dual:
@@ -512,6 +543,8 @@ def translate_file(
         str(file_mono),
         gr.update(visible=False),
         str(file_dual),
+        file_side,
+        gr.update(visible=True),
         gr.update(visible=True),
         gr.update(visible=True),
         gr.update(visible=True),
@@ -1010,6 +1043,9 @@ with gr.Blocks(
             output_file_dual = gr.File(
                 label="Download Translation (Dual)", visible=False
             )
+            output_file_side = gr.File(
+                label="Download Translation (Side by Side)", visible=False
+            )
             recaptcha_response = gr.Textbox(
                 label="reCAPTCHA Response", elem_id="verify", visible=False
             )
@@ -1150,8 +1186,10 @@ with gr.Blocks(
             output_file_mono,
             preview,
             output_file_dual,
+            output_file_side,
             output_file_mono,
             output_file_dual,
+            output_file_side,
             output_title,
             preview_original,
             preview_translated,
